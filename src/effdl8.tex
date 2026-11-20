@@ -1,0 +1,589 @@
+\documentclass[11pt,a4paper]{article}
+
+% ============================================================
+% PREAMBLE
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T2A,T1]{fontenc}
+\usepackage[english,russian]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage[a4paper,margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,amsfonts}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes,shapes.geometric,calc,fit,backgrounds,decorations.pathreplacing}
+
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{epigraph}
+\usepackage{quoting}
+\quotingsetup{font=small,leftmargin=2em,rightmargin=2em}
+
+\usepackage[hidelinks,colorlinks=true,linkcolor=black!70!blue,urlcolor=blue!60!black,citecolor=black!70!blue]{hyperref}
+
+% Epigraph styling
+\setlength{\epigraphwidth}{0.55\textwidth}
+\renewcommand{\epigraphflush}{flushright}
+\renewcommand{\textflush}{flushright}
+\renewcommand{\epigraphsize}{\small\itshape}
+
+% Theorem environments
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}[definition]{Remark}
+\newtheorem{example}[definition]{Example}
+
+\theoremstyle{plain}
+\newtheorem{proposition}[definition]{Proposition}
+
+% Custom colors
+\definecolor{kvpink}{RGB}{252,220,220}
+\definecolor{llmblue}{RGB}{210,230,255}
+\definecolor{sramorange}{RGB}{255,220,180}
+\definecolor{hbmgreen}{RGB}{210,240,210}
+\definecolor{accentred}{RGB}{190,60,60}
+
+% Shortcuts
+\newcommand{\KV}{\text{KV}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\HBM}{\textsc{hbm}}
+\newcommand{\SRAM}{\textsc{sram}}
+\newcommand{\TTFT}{\textsc{ttft}}
+\newcommand{\LLM}{\textsc{llm}}
+\newcommand{\GPU}{\textsc{gpu}}
+
+\title{\Huge \textbf{Efficient Inference of Large Language Models} \\[0.3em]
+       \Large \textit{Runtime, Memory, and the Arithmetic of Serving}}
+\author{Lecture notes --- after Chigin Anton (Sber, GigaChat Runtime Platform)}
+\date{}
+
+% ============================================================
+% DOCUMENT
+% ============================================================
+\begin{document}
+\maketitle
+
+\epigraph{``The attention matrix is quadratic; the world is not.''}{--- folk wisdom, modernised}
+
+\tableofcontents
+\bigskip\hrule\bigskip
+
+% ============================================================
+\section{Introduction: What is inference?}
+% ============================================================
+
+
+In machine learning, \emph{inference} denotes the act of executing a model that has already been trained. Whereas training is the slow, expensive process by which a model absorbs statistical regularities from data --- adjusting hundreds of billions of parameters until it behaves sensibly --- inference is the comparatively humble task of \emph{using} that frozen object to answer a question.
+
+The operational distinction is sharp. Training requires both a \emph{forward pass} (to compute predictions) and a \emph{backward pass} (to compute gradients via backpropagation and update weights). Inference, by contrast, is pure forward pass: the weights are fixed, and the machinery of differentiation is simply absent.
+
+From the vantage of a production system, we demand three properties from our inference stack: it must be \textbf{fast}, \textbf{stable}, and \textbf{reliable}. These notes are concerned, almost exclusively, with the first. We shall say nothing about what a model \emph{knows} or how accurate it is; we shall ask instead how to make it \emph{answer quickly}, at scale, and under the awkward constraints of real hardware.
+
+\begin{remark}
+The everyday experience of using a chatbot --- that brief hesitation between prompt and reply, the staccato arrival of tokens --- is the surface manifestation of the entire machinery we are about to dissect. Whether one serves GPT-2 or a frontier model, the shape of the pipeline is the same.
+\end{remark}
+
+% ============================================================
+\section{Latency and the Time to First Token}
+% ============================================================
+
+To quantify what a user perceives, we need metrics. The first and most important is the \textbf{Time to First Token} (\TTFT{}).
+
+\begin{definition}[Time to First Token]
+\TTFT{} is the wall-clock duration from the moment a request is submitted to the model until the first generated token becomes available.
+\end{definition}
+
+A subtle but important caveat: the \TTFT{} that a user observes in a browser is \emph{not} the model's raw \TTFT{}. It is inflated by network round-trips, front-end buffering, and rendering overhead. The observed figure therefore approximates the theoretical quantity but does not equal it. Still, every request --- irrespective of architecture or interface --- must pass through this initial processing stage before any token is emitted.
+
+The generation process that follows is intrinsically sequential. Except in specialised regimes such as \emph{Speculative Decoding}, a single forward pass produces a single token. This is not an implementation choice but an architectural fact about autoregressive decoders. To keep the user engaged despite this serial bottleneck, modern systems \emph{stream} tokens: the interface displays each token the instant it is produced, rather than waiting for the full answer.
+
+% ============================================================
+\section{The Autoregressive Pipeline and the KV-Cache}
+% ============================================================
+
+\subsection{Autoregressive generation, step by step}
+
+Let us follow a trivial prompt --- ``2+2?'' --- through the model.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Initialisation.} The input sequence is the prompt itself: \texttt{``2+2?''}.
+    \item \textbf{Processing.} The \LLM{} consumes the sequence and computes, for the terminal position, a probability distribution over its vocabulary.
+    \item \textbf{Token generation.} Using the attention mechanism, the model produces \emph{logits} --- raw, unnormalised scores for every token in the vocabulary. A sampling or argmax procedure selects one. In our Russian-language example, the first token emitted is \foreignlanguage{russian}{``будет''} (\emph{will be}).
+    \item \textbf{Context extension.} The chosen token is appended to the running sequence: \texttt{``2+2? будет''}.
+    \item \textbf{Iteration.} The cycle repeats. The next token, \foreignlanguage{russian}{``равно''}, extends the context to \texttt{``2+2? будет равно''}.
+    \item \textbf{Termination.} Generation halts when a designated end-of-sequence token ($\text{EOS}$) is emitted or a maximum length is reached. The final answer, \texttt{4}, is produced.
+\end{enumerate}
+
+\begin{definition}[Logits]
+The logits are the unnormalised outputs of the final linear layer of a language model. Passing them through a softmax yields a probability distribution over the vocabulary; selecting from this distribution yields the next token.
+\end{definition}
+
+\subsection{The KV-cache: exploiting causality}
+
+
+A naive implementation would, at every step, re-run attention over the entire growing context. This is wasteful to the point of absurdity: because the attention in decoder-only \LLM{}s is \emph{causal}, the keys and values associated with earlier tokens never change. Their contribution to attention is fixed the moment they are computed.
+
+\begin{definition}[KV-cache]
+The \emph{KV-cache} (Key--Value cache) is a memory structure that stores the key matrices $K$ and value matrices $V$ produced for every token processed so far. During subsequent decoding steps, these cached tensors are reused rather than recomputed.
+\end{definition}
+
+The KV-cache turns a process that would otherwise cost $O(n^2)$ per token into something linear (or, with more sophisticated attention variants, even sublinear) in the context length.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.1cm,
+    every node/.style={font=\small},
+    box/.style={rectangle,rounded corners,draw,minimum height=0.9cm,minimum width=2.2cm,align=center},
+    llm/.style={rectangle,rounded corners,draw,fill=llmblue,minimum height=0.9cm,minimum width=1.6cm},
+    kv/.style={rectangle,rounded corners,draw,fill=kvpink,minimum height=0.9cm,minimum width=1.6cm},
+    arr/.style={-Stealth,thick}
+]
+\node[box] (p) {\texttt{2+2?}};
+\node[llm,below=of p] (l1) {LLM};
+\node[box,below=of l1] (t1) {\texttt{2+2? будет}};
+
+\node[kv,right=2.6cm of l1] (kv1) {KV\textsubscript{1}};
+\node[llm,right=of kv1] (l2) {LLM};
+\node[kv,right=of l2] (kv2) {KV\textsubscript{2}};
+\node[llm,right=of kv2] (l3) {LLM};
+\node[box,below=of l3] (out) {\texttt{4}};
+
+\draw[arr] (p) -- (l1);
+\draw[arr] (l1) -- (t1);
+\draw[arr] (t1.east) -- ($(kv1.west)+(-0.1,0)$);
+\draw[arr] (kv1) -- (l2);
+\draw[arr] (l2) -- (kv2);
+\draw[arr] (kv2) -- (l3);
+\draw[arr] (l3) -- (out);
+\end{tikzpicture}
+\captionof{figure}{Autoregressive generation with KV-cache reuse. Each subsequent LLM call consumes the accumulated KV state rather than reprocessing the prompt.}
+\end{center}
+
+\begin{remark}
+During training, causality is not always imposed --- encoder models, for example, are free to attend in both directions. Inference, by contrast, lives under the strict tyranny of the past: each token may only look backward. This asymmetry is precisely what makes the KV-cache possible.
+\end{remark}
+
+% ============================================================
+\section{Prefill and Decode: the two phases}
+% ============================================================
+
+The lifecycle of a single request naturally partitions into two phases with qualitatively different computational profiles.
+
+\subsection{Prefill (context ingestion)}
+
+The \textbf{prefill} phase processes the entire prompt in a single large forward pass. All tokens are handled in parallel, and their keys and values populate the KV-cache in one sweep. Prefill is \emph{compute-bound}: one is performing a dense matrix multiplication on a long sequence, which saturates the GPU's arithmetic units.
+
+\subsection{Decode (autoregressive generation)}
+
+Once prefill is complete, the model transitions into the \textbf{decode} phase, generating tokens one at a time. At each step, the model:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item reads the cached $K, V$ tensors for all preceding tokens,
+    \item computes the new token's own $K, V$ and appends them to the cache,
+    \item emits a single output token.
+\end{itemize}
+Decode is \emph{memory-bound}: the computation per step is small, but the entirety of the model weights must be streamed through the GPU's memory hierarchy for every token. This asymmetry between prefill and decode drives almost every optimisation we shall discuss.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.9cm,
+    every node/.style={font=\small},
+    phase/.style={rectangle,rounded corners,draw,minimum height=1cm,minimum width=3.2cm,align=center,thick},
+    arr/.style={-Stealth,thick}
+]
+\node[phase,fill=llmblue] (pref) {\textbf{Prefill}\\ compute-bound \\ whole prompt in one pass};
+\node[phase,fill=kvpink,right=1.5cm of pref] (dec) {\textbf{Decode}\\ memory-bound \\ one token per pass};
+\draw[arr] (pref) -- (dec) node[midway,above]{KV-cache built};
+\end{tikzpicture}
+\captionof{figure}{The two regimes of LLM inference. Prefill floods the arithmetic units; decode starves them.}
+\end{center}
+
+\subsection{Attention variants}
+
+Two mechanisms deserve named mention:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Multi-Head Attention (MHA)}: the standard formulation. In its naive form, complexity per decoding step scales with context length; \emph{FlashAttention} (Section~\ref{sec:flash}) substantially improves both its wall time and its memory footprint.
+    \item \textbf{Grouped Query Attention (GQA)}: a family of variants in which multiple query heads share the same key and value projections, shrinking the KV-cache by a large constant factor and reducing the decoder's dependence on context length.
+\end{itemize}
+Under either scheme, the per-step computational cost is \emph{deterministic} given the sequence geometry --- a property we shall exploit when scheduling.
+
+% ============================================================
+\section{Online vs.\ Offline Inference}
+% ============================================================
+
+
+It is tempting to identify ``LLM inference'' with the real-time chatbot, but a great deal of LLM output today is generated asynchronously, far from any user's gaze. Enterprise workloads --- legal-contract analysis, proposal generation, strategic summarisation --- often require no real-time responsiveness whatsoever. Such \emph{offline} or \emph{batch} workloads permit optimisations (aggressive batching, overnight scheduling, cheaper hardware tiers) that would be intolerable in an interactive setting. The remainder of these notes tends toward the interactive case, because it is the harder one.
+
+% ============================================================
+\section{Batching without Padding}
+% ============================================================
+
+A \GPU{} that processes one request at a time is a \GPU{} mostly asleep. To extract reasonable throughput, we must group concurrent requests into \emph{batches}. The difficulty is that the requests in a batch typically have different lengths, and the natural tensor representation is rectangular.
+
+\subsection{The padding tax}
+
+The standard remedy is to \textbf{pad} shorter sequences to the length of the longest in the batch, producing a uniform tensor of shape $[\,\text{bs}\times\text{seqlen},\,\text{hidden}\,]$. But if sequence lengths vary widely, padding can consume up to $80\%$ of the flops in the batch --- compute spent entirely on tokens that contribute nothing to any output.
+
+\subsection{Offset-based batching}
+
+The optimisation, associated with engineers at ByteDance and incorporated into libraries such as \textsc{FasterTransformer}, is to treat the batch not as a rectangle but as a \emph{concatenation of variable-length sequences}, accompanied by metadata that records where each sequence begins.
+
+\begin{definition}[Sequence-length offsets]
+Given sequence lengths $L = [\ell_1, \ell_2, \dots, \ell_n]$, the cumulative offset vector $O$ is
+\[
+O_i = \sum_{j=1}^{i-1} \ell_j, \qquad O_1 = 0.
+\]
+\end{definition}
+
+\begin{example}
+For $L = [2,1,3]$, the offsets are
+\[
+O = [\,0,\; 0+2,\; 0+2+1,\; 0+2+1+3\,] = [0,2,3,6].
+\]
+The first sequence occupies positions $0$--$1$ of the flattened tensor; the second, position $2$; the third, positions $3$--$5$.
+\end{example}
+
+Armed with these offsets, kernels can skip padding entirely: the computation is condensed onto the non-zero elements alone. In practice this yields a speedup of roughly $2\times$ across typical batch configurations --- a free improvement, attributable purely to accounting.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.4cm and 1.8cm,
+    every node/.style={font=\small},
+    block/.style={rectangle,rounded corners,draw,fill=llmblue!60,minimum height=1cm,minimum width=2.8cm,align=center,text width=2.8cm},
+    arr/.style={-Stealth,thick}
+]
+\node[block] (inp) {Variable-length\\ inputs};
+\node[block,right=of inp] (pad) {Add padding};
+\node[block,right=of pad] (resh) {Reshape to\\ $[\text{bs}\!\times\!\text{seqlen},h]$};
+\node[block,below=of resh] (off) {Compute id\\ \& length offsets};
+\node[block,left=of off] (run) {Run kernels on\\ valid tokens only};
+\node[block,left=of run] (final) {Unpadded\\ output};
+
+\draw[arr] (inp)--(pad);
+\draw[arr] (pad)--(resh);
+\draw[arr] (resh)--(off);
+\draw[arr] (off)--(run);
+\draw[arr] (run)--(final);
+\end{tikzpicture}
+\captionof{figure}{The logical path of a padded batch that is never actually processed as padded.}
+\end{center}
+
+% ============================================================
+\section{FlashAttention}\label{sec:flash}
+% ============================================================
+
+
+\subsection{The bottleneck: materialising $QK^\top$}
+
+Standard attention computes
+\begin{equation}
+O \;=\; \mathrm{Dropout}\!\left(\softmax(\mathrm{Mask}(QK^\top))\, V\right),
+\end{equation}
+where $Q,K,V \in \mathbb{R}^{N\times d}$. The trouble is the intermediate matrix $A = QK^\top$: it has shape $N\times N$, and thus memory footprint $O(N^2)$. For long sequences, $A$ no longer fits comfortably on the \GPU{}, and each step (mask, softmax, dropout, multiply by $V$) entails further reads from and writes to the slow \HBM{}.
+
+\subsection{The \GPU{} memory hierarchy}
+
+To understand why this matters, we must look at the hardware:
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+\node[draw,rounded corners,fill=sramorange!60,minimum width=7cm,minimum height=0.9cm] (sram) at (0,2) {\SRAM{}: $\approx 19$ TB/s, $\approx 20$ MB};
+\node[draw,rounded corners,fill=hbmgreen!60,minimum width=7cm,minimum height=0.9cm] (hbm) at (0,1) {\GPU{} \HBM{}: $\approx 1.5$ TB/s, $\approx 40$ GB};
+\node[draw,rounded corners,fill=llmblue!60,minimum width=7cm,minimum height=0.9cm] (dram) at (0,0) {\textsc{cpu} DRAM: $\approx 13$ GB/s, $>\!1$ TB};
+
+\node[left=0.3cm of sram,align=right] {tiny\\ \& fastest};
+\node[left=0.3cm of hbm,align=right] {moderate\\ \& fast};
+\node[left=0.3cm of dram,align=right] {vast\\ \& slow};
+\end{tikzpicture}
+\captionof{figure}{The memory hierarchy of an NVIDIA A100, simplified. Bandwidth falls by more than an order of magnitude at each step down.}
+\end{center}
+
+Computation happens inside \SRAM{}; everything else is transport. A naive attention implementation reads the $N\times N$ matrix from \HBM{}, masks it, writes it back; reads it, softmaxes it, writes it back; and so on. The arithmetic is trivial compared with the traffic.
+
+\subsection{The idea: tile, fuse, stream}
+
+FlashAttention refuses to materialise $A$ in \HBM{} at all. Instead, it decomposes attention into blocks small enough to live entirely in \SRAM{}, performs all intermediate operations (mask, softmax, $V$-product) within that fast memory, and writes only the final output to \HBM{}.
+
+The crucial mathematical observation is that softmax is decomposable across a partition, \emph{provided} one carries a little state. For a concatenation $x = [x^{(1)}, x^{(2)}]$, define
+\begin{align}
+m(x) &= \max\bigl(m(x^{(1)}),\, m(x^{(2)})\bigr), \\[2pt]
+f(x) &= e^{m(x^{(1)}) - m(x)} f(x^{(1)}) \;+\; e^{m(x^{(2)}) - m(x)} f(x^{(2)}), \\[2pt]
+\ell(x) &= e^{m(x^{(1)}) - m(x)} \ell(x^{(1)}) \;+\; e^{m(x^{(2)}) - m(x)} \ell(x^{(2)}), \\[2pt]
+\softmax(x) &= \frac{f(x)}{\ell(x)}.
+\end{align}
+By maintaining only $m$ (the running maximum, for numerical stability) and $\ell$ (the running denominator), one can update the attention output \emph{incrementally}, block by block, never storing the full $N\times N$ matrix.
+
+\subsection{The algorithm}
+
+\begin{proposition}[FlashAttention, schematic]
+Given $Q,K,V \in \mathbb{R}^{N\times d}$ in \HBM{} and an \SRAM{} budget $M$:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+    \item Partition $Q, K, V$ into blocks $Q_i, K_j, V_j$ sized to fit in \SRAM{}.
+    \item For each block $i$ of $Q$, iterate over blocks $j$ of $K,V$:
+    \begin{enumerate}[label=(\alph*),itemsep=1pt]
+        \item load $Q_i, K_j, V_j$ from \HBM{} into \SRAM{};
+        \item compute the local contribution and update the running $m_i, \ell_i, O_i$;
+    \end{enumerate}
+    \item after the inner loop, write $O_i$ back to \HBM{}.
+\end{enumerate}
+\end{proposition}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.9cm,
+    every node/.style={font=\small},
+    box/.style={rectangle,rounded corners,draw,minimum height=0.85cm,minimum width=3.2cm,align=center},
+    arr/.style={-Stealth,thick}
+]
+\node[box,fill=hbmgreen!50] (load) {Load block: \HBM{} $\to$ \SRAM{}};
+\node[box,fill=sramorange!60,below=of load] (comp) {Compute attention in \SRAM{}};
+\node[box,fill=sramorange!60,below=of comp] (upd) {Update running $m,\ell,O$};
+\node[box,fill=hbmgreen!50,below=of upd] (store) {Write block: \SRAM{} $\to$ \HBM{}};
+\draw[arr] (load)--(comp);
+\draw[arr] (comp)--(upd);
+\draw[arr] (upd.east)..controls +(2.5,0) and +(2.5,0)..(load.east) node[midway,right]{next block};
+\draw[arr] (upd)--(store);
+\end{tikzpicture}
+\captionof{figure}{The FlashAttention loop. Heavy traffic to \HBM{} --- reading and writing the $N\!\times\!N$ attention matrix --- is replaced by tiled I/O of the much smaller inputs and outputs.}
+\end{center}
+
+\subsection{Results}
+
+FlashAttention's claims are, by the standards of the field, remarkable:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Exact}: there is no approximation. The output is bit-for-bit what standard attention produces (modulo floating-point associativity).
+    \item \textbf{$2\text{--}4\times$ faster} on NVIDIA A100 for sequences from $512$ to $4096$, with the speedup growing with context length.
+    \item \textbf{$10\text{--}20\times$ less memory}, scaling \emph{linearly} in $N$ rather than quadratically.
+\end{itemize}
+These gains compound as sequence length increases, which is precisely why the technique is now indispensable for any serious long-context work.
+
+\subsection{Hardware co-evolution: versions 2, 3, and beyond}
+
+The algorithmic core of FlashAttention is stable; the implementation is not. FlashAttention-2 and -3 --- and, prospectively, -4 for the forthcoming B200 architecture --- retain the same recursive-softmax logic but rewrite the kernel around each new generation of \GPU{}. Each generation brings new tensor-core capabilities, shifting \SRAM{} budgets, more registers, and higher-bandwidth memory subsystems. The algorithm is transferable; the speed records are not.
+
+On an H100 80GB SXM5, benchmarking across sequence lengths from 512 to 16k, with head dimensions of 64 and 128, both with and without causal masking, one observes throughput reaching roughly 650--680 TFLOP/s for FlashAttention-3 in the most favourable configurations --- limits set by the silicon itself, not the algorithm.
+
+\begin{remark}[A caveat on custom masks]
+FlashAttention's optimisations rest on rigid tiling and kernel fusion patterns tuned for the standard case: no mask or a causal mask. Arbitrary custom masks typically break these optimisations. Implementations supporting custom masking exist but often recover only a fraction of the standard-case performance. If your architecture genuinely requires a non-standard mask, budget for this cost.
+\end{remark}
+
+% ============================================================
+\section{Continuous Batching}
+% ============================================================
+
+
+Static batching --- the traditional approach --- gathers $B$ requests, processes them together, and does not accept new arrivals until the entire batch has finished. Because decode terminates whenever any individual sequence emits its \textsc{eos} token (or hits the length cap), a batch with heterogeneous output lengths is dominated by its slowest member. Everyone else waits.
+
+\subsection{The continuous alternative}
+
+\textbf{Continuous batching}, also known as \emph{persistent batch inference}, abolishes this synchronisation. New requests are injected into the running batch the instant a slot opens; completed requests are evicted immediately. The batch lives as a continuously refreshed pool of in-flight work.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+% Axes
+\draw[-Stealth,thick] (0,0) -- (10.5,0) node[right] {time};
+\draw[-Stealth,thick] (0,0) -- (0,4.5) node[above] {slot};
+
+% Slot labels
+\foreach \y in {1,2,3,4} {
+    \node[left] at (0,\y-0.2) {\y};
+    \draw[dotted,gray!50] (0,\y-0.2) -- (10,\y-0.2);
+}
+
+% Request 1: long, slot 1
+\draw[fill=orange!40] (0.3,0) rectangle (1.1,0.8); \node[font=\tiny] at (0.7,0.4) {pre};
+\draw[fill=kvpink] (1.1,0) rectangle (7.8,0.8);
+
+% Request 2: slot 2, medium, then slot 2 reused
+\draw[fill=orange!40] (0.3,0.9) rectangle (1.0,1.7); \node[font=\tiny] at (0.65,1.3) {pre};
+\draw[fill=kvpink] (1.0,0.9) rectangle (4.0,1.7);
+\draw[fill=orange!40] (4.2,0.9) rectangle (4.9,1.7); \node[font=\tiny] at (4.55,1.3) {pre};
+\draw[fill=kvpink] (4.9,0.9) rectangle (9.5,1.7);
+
+% Request 3: slot 3 short, then another short, then long
+\draw[fill=orange!40] (0.8,1.9) rectangle (1.5,2.7); \node[font=\tiny] at (1.15,2.3) {pre};
+\draw[fill=kvpink] (1.5,1.9) rectangle (3.0,2.7);
+\draw[fill=orange!40] (3.2,1.9) rectangle (3.9,2.7); \node[font=\tiny] at (3.55,2.3) {pre};
+\draw[fill=kvpink] (3.9,1.9) rectangle (6.0,2.7);
+\draw[fill=orange!40] (6.2,1.9) rectangle (6.9,2.7); \node[font=\tiny] at (6.55,2.3) {pre};
+\draw[fill=kvpink] (6.9,1.9) rectangle (10,2.7);
+
+% Request 4: slot 4
+\draw[fill=orange!40] (1.5,2.9) rectangle (2.4,3.7); \node[font=\tiny] at (1.95,3.3) {pre};
+\draw[fill=kvpink] (2.4,2.9) rectangle (5.5,3.7);
+\draw[fill=orange!40] (5.7,2.9) rectangle (6.5,3.7); \node[font=\tiny] at (6.1,3.3) {pre};
+\draw[fill=kvpink] (6.5,2.9) rectangle (9.8,3.7);
+
+% Legend
+\node[draw,fill=orange!40,inner sep=2pt] at (7.5,4.3) {};
+\node[right] at (7.6,4.3) {\footnotesize prefill};
+\node[draw,fill=kvpink,inner sep=2pt] at (9.2,4.3) {};
+\node[right] at (9.3,4.3) {\footnotesize decode};
+\end{tikzpicture}
+\captionof{figure}{Continuous batching. Each slot is a ``seat'' in the running batch; when one request finishes, the next is seated without disturbing its neighbours.}
+\end{center}
+
+Every request still passes through both phases --- a dense \textbf{prefill} on arrival, followed by iterative \textbf{decode} --- but phases belonging to different requests are interleaved freely. The scheduler's job is to keep the \GPU{} maximally occupied by mixing ongoing decodes with fresh prefills.
+
+\subsection{The prefill-decode conflict}
+
+A naive scheduler faces a sharp tension. Prefills are expensive, bursty, and compute-bound; decodes are cheap per step but latency-critical. If a request arrives with a very long prompt --- say $50{,}000$ tokens --- processing its prefill in one shot stalls every ongoing decode. Splitting the prefill into smaller chunks mitigates stalling at the cost of additional scheduling complexity. This is the essential trade-off of modern inference schedulers, and it admits no universally optimal solution.
+
+\begin{remark}
+Real workloads also fail to present requests as a uniform Poisson stream. Bursts, lulls, and pathological outliers are the rule. Any production system must keep a buffer of hardware headroom to absorb these without grinding to a halt.
+\end{remark}
+
+% ============================================================
+\section{PagedAttention and KV-Cache Management}
+% ============================================================
+
+
+Continuous batching optimises \emph{scheduling}; it does nothing about \emph{memory}. The KV-cache, in a naive implementation, is the villain of the inference memory budget: it grows linearly with context length, and traditional allocation reserves contiguous physical memory for the longest possible sequence --- most of which will never be used. The result is internal fragmentation of spectacular proportions, and no way to share state between requests that have common prefixes.
+
+\subsection{The paging analogy}
+
+\textbf{PagedAttention}, introduced by the vLLM project, transplants virtual-memory paging into the KV-cache.
+
+\begin{definition}[Paged KV-cache]
+The KV-cache is partitioned into fixed-size \emph{blocks}. A \emph{logical} sequence of blocks (as seen by the model) is mapped, via a per-sequence \emph{block table}, to \emph{physical} blocks located anywhere in \GPU{} memory.
+\end{definition}
+
+The logical view presents a tidy contiguous sequence; the physical view is a heap of scattered blocks. The block table is the dictionary translating between them.
+
+\begin{center}
+\begin{tikzpicture}[every node/.style={font=\small}]
+% Logical
+\node at (-0.5,4.5) {\textbf{Logical blocks}};
+\foreach \i/\x in {0/0,1/1.4,2/2.8,3/4.2} {
+    \draw[thick] (\x,3.7) rectangle (\x+1.2,4.3);
+    \node at (\x+0.6,4.0) {Block \i};
+}
+
+% Block table
+\node at (8,4.5) {\textbf{Block table}};
+\draw (7,3.7) rectangle (9,1.7);
+\foreach \i/\p in {0/0,1/1,2/5,3/2} {
+    \node at (7.4,3.5-\i*0.5) {\i};
+    \node at (7.9,3.5-\i*0.5) {$\mapsto$};
+    \node at (8.4,3.5-\i*0.5) {\p};
+}
+
+% Physical
+\node at (-0.5,0.5) {\textbf{Physical blocks}};
+\foreach \i/\x in {0/0,1/0.9,2/1.8,3/2.7,4/3.6,5/4.5,6/5.4,7/6.3} {
+    \draw[thick] (\x,0) rectangle (\x+0.8,0.6);
+    \node at (\x+0.4,0.3) {\i};
+}
+
+% Arrows logical -> physical, through table
+\draw[-Stealth,thick,blue!60!black]  (0.6,3.7) .. controls (0.6,2.5) and (0.4,1.5) .. (0.4,0.6);
+\draw[-Stealth,thick,blue!60!black]  (2.0,3.7) .. controls (2.0,2.5) and (1.3,1.5) .. (1.3,0.6);
+\draw[-Stealth,thick,blue!60!black]  (3.4,3.7) .. controls (3.4,2.5) and (4.9,1.5) .. (4.9,0.6);
+\draw[-Stealth,thick,blue!60!black]  (4.8,3.7) .. controls (4.8,2.5) and (2.2,1.5) .. (2.2,0.6);
+
+\end{tikzpicture}
+\captionof{figure}{The logical--physical indirection of PagedAttention. Logical blocks $0,1,2,3$ happen to live at physical locations $0,1,5,2$. The sequence neither knows nor cares.}
+\end{center}
+
+\subsection{Three consequences}
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Fragmentation dissolves.} Memory is allocated one block at a time, on demand. There is no need to reserve space for tokens that may never be generated.
+    \item \textbf{Prefix sharing becomes trivial.} If two sequences begin with the same prompt --- a system prompt shared across thousands of concurrent chats, say --- their block tables can point to the \emph{same} physical blocks for the shared prefix. One computation, many consumers. Causality guarantees that what is cached for the shared prefix is genuinely identical.
+    \item \textbf{Copy-on-write just works.} When two sequences that share a prefix diverge, the first divergent block is simply copied, its reference count decremented in the original, and the sequences proceed independently. This is, quite literally, the textbook \textsc{unix} \texttt{fork} semantics, applied to tensors.
+\end{enumerate}
+
+\begin{remark}[Does random access cost us?]
+A natural worry: if physical blocks are scattered, are we paying a gather penalty? In practice, not meaningfully. DRAM is random-access by design; reads occur at a cache-line granularity well below the block size; and the KV-cache blocks are large enough that paging overhead is a rounding error. Contiguity, it turns out, was never as sacred as it felt.
+\end{remark}
+
+\subsection{Very long contexts and cross-request caching}
+
+Models advertising million-token (Gemini) or ten-million-token (Qwen variants) context windows are an incremental, not revolutionary, extension of these techniques. A more interesting optimisation is the reuse of KV-cache \emph{across} requests. If a user continues a conversation a minute after their last turn, recomputing $700{,}000$ tokens of context from scratch is indefensible. An \textsc{lru}-managed tiered cache --- \HBM{}, then \textsc{cpu} RAM, then disk --- allows previously computed KV state to be reclaimed on a cache hit, at the cost of some retrieval latency. The principle is ancient, the pressure is new.
+
+\begin{remark}[Caching and load balancing interact]
+If request $R$ was first processed on host $A$, its cached KV state lives on $A$. Should the load balancer steer $R$'s follow-up to host $B$, the system must either ship the cached state (often prohibitively expensive) or recompute it (wasteful). Any caching strategy is only as good as the routing that respects it.
+\end{remark}
+
+% ============================================================
+\section{Tensor Parallelism}
+% ============================================================
+
+
+Some models --- a 70B or 700GB behemoth --- cannot fit on a single \GPU{} at any precision. \textbf{Tensor Parallelism} (TP) partitions large weight matrices across multiple \GPU{}s, with each device computing a slice of every layer and exchanging partial results via collective communication.
+
+\subsection{Mechanics}
+
+Consider a linear layer $Y = XW$ with $W$ split column-wise across two \GPU{}s: $W = [W_1 \mid W_2]$. Then
+\begin{equation}
+Y = X\,[W_1 \mid W_2] \;=\; [XW_1 \mid XW_2],
+\end{equation}
+and the two partial products $XW_1$, $XW_2$ can be computed independently, one per device. The subsequent layer, if row-partitioned, concludes with an \emph{all-reduce} (or \emph{scatter-reduce}) that sums the contributions across devices.
+
+The general pattern is:
+
+\begin{center}
+\begin{tikzpicture}[
+    every node/.style={font=\small},
+    box/.style={rectangle,rounded corners,draw,minimum height=0.8cm,minimum width=1.8cm,align=center},
+    arr/.style={-Stealth,thick}
+]
+\node[box,fill=llmblue!60] (in) {Input $X$};
+\node[box,fill=hbmgreen!50,right=1.1cm of in] (ag) {All-gather};
+\node[box,fill=sramorange!60,above right=0.1cm and 1.1cm of ag] (g1) {$W_1$};
+\node[box,fill=sramorange!60,below right=0.1cm and 1.1cm of ag] (g2) {$W_2$};
+\node[box,right=1.1cm of g1] (p1) {$XW_1$};
+\node[box,right=1.1cm of g2] (p2) {$XW_2$};
+\node[box,fill=hbmgreen!50,right=1.3cm of $(p1)!0.5!(p2)$] (sr) {Scatter-reduce};
+\node[box,fill=llmblue!60,right=1.1cm of sr] (out) {Output $Y$};
+
+\draw[arr] (in)--(ag);
+\draw[arr] (ag.east)--(g1.west);
+\draw[arr] (ag.east)--(g2.west);
+\draw[arr] (g1)--(p1);
+\draw[arr] (g2)--(p2);
+\draw[arr] (p1.east)--(sr.west);
+\draw[arr] (p2.east)--(sr.west);
+\draw[arr] (sr)--(out);
+
+\node[left=0.2cm of g1] {GPU\textsubscript{1}};
+\node[left=0.2cm of g2] {GPU\textsubscript{2}};
+\end{tikzpicture}
+\captionof{figure}{Tensor parallelism on two \GPU{}s: partitioned compute, with communication at the endpoints of each layer.}
+\end{center}
+
+\subsection{Performance and scaling}
+
+Concrete numbers are sobering. For a small benchmark --- batch 256, input length 20, output length 8 --- a single \GPU{} takes roughly $1352\,\text{ms}$; on eight \GPU{}s, approximately $400\,\text{ms}$. That is a $\approx 3.4\times$ speedup on $8\times$ the hardware. The gap reflects collective-communication overhead and Amdahl-style serial fractions.
+
+TP scales best across tight clusters of 2--4 \GPU{}s connected by high-bandwidth interconnects (\textsc{nvlink} within a node; \textsc{infiniband} across nodes). Beyond that, the synchronisation required at every layer becomes a dominant cost. Scaling to 100 \GPU{}s via tensor parallelism alone is not something one does; one combines TP with pipeline parallelism, sequence parallelism, and expert parallelism in an elaborate hierarchy.
+
+\begin{remark}[A worked capacity estimate]
+A DeepSeek-scale model at FP8 precision requires about $700\,\text{GB}$ of weights alone. An H100 with $80\,\text{GB}$ of \HBM{} is not, on its own, sufficient; one needs at minimum $8\times 80\,\text{GB} = 640\,\text{GB}$ of aggregate \HBM{} just for the parameters, and in practice somewhat more to accommodate activations, KV-cache, and implementation overhead. Production deployments typically provision $16$ \GPU{}s rather than the theoretical $9$.
+\end{remark}
+
+% ============================================================
+\section{The Software Stack}
+% ============================================================
+
+The contemporary inference ecosystem rests on a small set of open-source frameworks, each with its own design emphases:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item \textbf{vLLM} --- the canonical PagedAttention implementation; broad model coverage and pleasant ergonomics.
+    \item \textbf{SGLang} --- structured generation and aggressive KV-cache reuse.
+    \item \textbf{NVIDIA TensorRT-LLM} --- tight hardware integration, impressive peak throughput, comparatively opaque internals.
+    \item \textbf{llama.cpp} --- CPU-forward, quantised, and remarkably capable on consumer hardware.
+\end{itemize}
+
+Beneath them, the familiar hybrid: \textsc{cuda} and C\texttt{++} for the hot kernels, Python for everything else. One writes a kernel in \textsc{cuda} when one must and in Python when one can, and learns to live with the bindings in between. No single framework dominates; the right choice depends entirely on the deployment's priorities --- peak throughput, flexibility, target hardware, or developer velocity.
+
+\subsection{Quantisation and FP8}
+
+A final implementation note. Casting weights and activations to 8-bit floating point (\textsc{fp8}) can roughly halve memory and KV-cache footprint, at the risk of numerical degradation if done naively. The standard procedure is a \emph{calibration} pass in which attention blocks and feed-forward networks are jointly calibrated in \textsc{fp8}, preserving the network's functional behaviour. After calibration, the operational semantics are unchanged --- the arithmetic proceeds exactly as before, only in a smaller number system. FP4 and lower will arrive with the next hardware generation (\textsc{b200} and successors), bundled with their own libraries; building it oneself today would be premature.
+
+\end{document}
