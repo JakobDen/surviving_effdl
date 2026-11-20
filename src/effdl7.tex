@@ -82,7 +82,7 @@
 % ---------- Title ----------
 \title{\textbf{Networking, Web Services, and Inference APIs} \\[0.4em]
        \large Lecture Notes on TCP/IP, HTTP, gRPC, and Observability}
-\author{Lecture Transcript --- Edited and Typeset}
+\author{Lecture Transcript}
 \date{}
 
 \begin{document}
@@ -647,19 +647,5 @@ def classify(array):
 \end{lstlisting}
 
 This is the whole of the plumbing. The channel transmits bytes; the stub enforces types; the protobuf messages serialise structure. Everything else --- Flask, Prometheus, Grafana, the layered JSON façade --- is arranged in concentric rings around this inner call.
-
-% ============================================================
-\section{Closing Remarks}
-
-We have travelled a considerable distance in a short time: from the layered structure of the TCP/IP stack, through the grammar of HTTP requests and responses, into the pragmatics of deploying and monitoring a Flask service, and finally into the design of a two-tier inference API built on gRPC and Protocol Buffers.
-
-Two themes recur. The first is the productive tension between \emph{accessibility} and \emph{efficiency}: JSON is for humans and the edges of a system; binary formats are for machines and the interior. The second is the cost of abstraction: each layer --- TCP over IP, HTTP over TCP, gRPC over HTTP/2, the Client API over gRPC --- buys convenience in exchange for overhead, and the engineer's craft lies in choosing the overhead wisely.
-
-The forthcoming FDL module will revisit batching, caching, and tensor-graph optimisation in proper technical detail. For those of you considering entrepreneurial ventures, the framework established here is the scaffold on which a real product is built; for those of you who are merely curious, it is, I hope, a coherent account of why the web looks the way it does.
-
-\vfill
-\begin{flushright}
-\textit{--- end of lecture ---}
-\end{flushright}
 
 \end{document}
